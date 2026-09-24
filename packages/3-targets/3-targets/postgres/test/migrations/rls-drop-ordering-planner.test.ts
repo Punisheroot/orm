@@ -1,11 +1,12 @@
 /**
- * Where the planner puts RLS policy drops relative to structural DDL.
- * Postgres refuses to drop a column while a policy uses it, and refuses to
- * drop a table that a policy on another table uses. So when a plan drops a
- * column or a table, its policy drops run first.
+ * Where the planner puts RLS policy drops relative to structural DDL. Postgres refuses to drop a
+ * column or change its type while a policy uses it, and refuses to drop a table or an enum type
+ * that a policy on another table uses. So when a plan contains such a statement, its policy drops
+ * run just before it. Otherwise the plan keeps its usual order: structural DDL, then index and
+ * check-constraint renames, then policy calls.
  *
- * The planner does not parse policy bodies, so the `using` text below only
- * documents the dependency each scenario is about.
+ * The planner does not parse policy bodies, so the `using` text below only documents the dependency
+ * each scenario is about.
  */
 
 import { type Contract, coreHash, profileHash } from '@internal/contract/types';
@@ -21,6 +22,7 @@ import { PostgresRlsPolicy } from '../../src/core/postgres-rls-policy';
 import { PostgresSchema } from '../../src/core/postgres-schema';
 import { PostgresDatabaseSchemaNode } from '../../src/core/schema-ir/postgres-database-schema-node';
 import { PostgresNamespaceSchemaNode } from '../../src/core/schema-ir/postgres-namespace-schema-node';
+import { PostgresNativeEnumSchemaNode } from '../../src/core/schema-ir/postgres-native-enum-schema-node';
 import { PostgresPolicySchemaNode } from '../../src/core/schema-ir/postgres-policy-schema-node';
 import { PostgresTableSchemaNode } from '../../src/core/schema-ir/postgres-table-schema-node';
 
@@ -127,6 +129,7 @@ function livePolicy(policy: PostgresRlsPolicy): PostgresPolicySchemaNode {
 function liveSchema(
   tables: Tables,
   policies: readonly PostgresRlsPolicy[],
+  nativeEnums: readonly string[] = [],
 ): PostgresDatabaseSchemaNode {
   const tableNodes: Record<string, PostgresTableSchemaNode> = {};
   for (const [tableName, shape] of Object.entries(tables)) {
@@ -161,6 +164,14 @@ function liveSchema(
       public: new PostgresNamespaceSchemaNode({
         schemaName: 'public',
         tables: tableNodes,
+        nativeEnums: nativeEnums.map(
+          (typeName) =>
+            new PostgresNativeEnumSchemaNode({
+              typeName,
+              namespaceId: 'public',
+              members: ['admin', 'member'],
+            }),
+        ),
       }),
     },
     roles: [],
@@ -172,13 +183,14 @@ function liveSchema(
 async function planOpIds(
   contract: Contract<SqlStorage>,
   schema: PostgresDatabaseSchemaNode,
+  fromContract: Contract<SqlStorage> | null = null,
 ): Promise<readonly string[]> {
   const planner = createPostgresMigrationPlanner(stubLowerer);
   const result = planner.plan({
     contract,
     schema,
     policy: { allowedOperationClasses: ['additive', 'widening', 'destructive'] },
-    fromContract: null,
+    fromContract,
     frameworkComponents: [],
     spaceId: APP_SPACE_ID,
     snapshotsImportPath: '../../snapshots',
@@ -235,6 +247,52 @@ describe('policy drops run before structural DDL that the policy blocks', () => 
     expect(await planOpIds(contract, schema)).toEqual([
       'rlsPolicy.public.profiles.p_team_22222222.drop',
       'dropTable.teams',
+    ]);
+  });
+
+  describe('an edited policy that uses a column whose type changes', () => {
+    const before = policyOn(
+      'profiles',
+      'p_read_11111111',
+      "(user_id = current_setting('app.user_id')::int4)",
+    );
+    const after = policyOn(
+      'profiles',
+      'p_read_22222222',
+      "(user_id = current_setting('app.user_id')::int8)",
+    );
+    const fromContract = buildContract({ profiles: PROFILES }, [before]);
+    const contract = buildContract({ profiles: { columns: { id: 'int4', user_id: 'int8' } } }, [
+      after,
+    ]);
+    const schema = liveSchema({ profiles: PROFILES }, [before]);
+    const expected = [
+      'rlsPolicy.public.profiles.p_read_11111111.drop',
+      'alterType.profiles.user_id',
+      'rlsPolicy.public.profiles.p_read_22222222',
+    ];
+
+    it('is dropped before the type change in a db update plan', async () => {
+      expect(await planOpIds(contract, schema)).toEqual(expected);
+    });
+
+    it('is dropped before the type change in a migration plan', async () => {
+      expect(await planOpIds(contract, schema, fromContract)).toEqual(expected);
+    });
+  });
+
+  it('drops a policy before dropping an enum type the policy casts to', async () => {
+    const adminOnly = policyOn(
+      'profiles',
+      'p_admin_22222222',
+      "(current_setting('app.role')::app_role = 'admin')",
+    );
+    const contract = buildContract({ profiles: PROFILES }, []);
+    const schema = liveSchema({ profiles: PROFILES }, [adminOnly], ['app_role']);
+
+    expect(await planOpIds(contract, schema)).toEqual([
+      'rlsPolicy.public.profiles.p_admin_22222222.drop',
+      'dropNativeEnumType.app_role',
     ]);
   });
 });

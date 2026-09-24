@@ -56,8 +56,10 @@ import {
 } from './issue-planner';
 import type { PostgresOpFactoryCall } from './op-factory-call';
 import {
+  AlterColumnTypeCall,
   CreatePostgresRlsPolicyCall,
   DropColumnCall,
+  DropNativeEnumTypeCall,
   DropPostgresRlsPolicyCall,
   DropTableCall,
   RenameCheckConstraintCall,
@@ -892,11 +894,11 @@ function isPolicyDiffIssue(issue: SchemaDiffIssue<SqlSchemaDiffNode>): boolean {
 }
 
 /**
- * Postgres refuses to drop a column while a policy uses it, and to drop a
- * table while a policy on another table uses it (2BP01). A table's own
- * policies go with the table. So every policy drop moves to just before the
- * first structural call that a policy can block. Without such a call, the
- * policy calls keep their place after the structural calls.
+ * Postgres refuses to drop a column while a policy uses it (2BP01) or to change its type (0A000),
+ * and refuses to drop a table or an enum type while a policy on another table uses it (2BP01). A
+ * table's own policies go with the table. So every policy drop moves to just before the first
+ * structural call that a policy can block. Without such a call, the policy calls keep their place
+ * after the structural calls.
  */
 function movePolicyDropsBeforeBlockedDdl(
   structural: readonly PostgresOpFactoryCall[],
@@ -906,7 +908,11 @@ function movePolicyDropsBeforeBlockedDdl(
   readonly policyCalls: readonly PostgresOpFactoryCall[];
 } {
   const firstBlockable = structural.findIndex(
-    (call) => call instanceof DropTableCall || call instanceof DropColumnCall,
+    (call) =>
+      call instanceof DropColumnCall ||
+      call instanceof AlterColumnTypeCall ||
+      call instanceof DropTableCall ||
+      call instanceof DropNativeEnumTypeCall,
   );
   if (firstBlockable === -1) {
     return { structural, policyCalls };
