@@ -11,7 +11,7 @@
 import { type Contract, coreHash, profileHash } from '@internal/contract/types';
 import type { ExecuteRequestLowerer } from '@internal/family-sql/control-adapter';
 import { APP_SPACE_ID } from '@internal/framework-components/control';
-import { SqlStorage, StorageTable } from '@internal/sql-contract/types';
+import { indexInputFromSerialized, SqlStorage, StorageTable } from '@internal/sql-contract/types';
 import { parseNaming } from '@internal/sql-schema-ir/naming';
 import { applicationDomainOf } from '@repo/test-utils';
 import { describe, expect, it } from 'vitest';
@@ -29,8 +29,15 @@ const stubLowerer: ExecuteRequestLowerer = {
   lowerToExecuteRequest: async () => ({ sql: 'stub', params: [] }),
 };
 
+interface WireIndex {
+  readonly prefix: string;
+  readonly hash: string;
+  readonly columns: readonly string[];
+}
+
 interface TableShape {
   readonly columns: Readonly<Record<string, string>>;
+  readonly indexes?: readonly WireIndex[];
 }
 
 type Tables = Readonly<Record<string, TableShape>>;
@@ -67,7 +74,14 @@ function buildContract(
       primaryKey: { columns: ['id'] },
       foreignKeys: [],
       uniques: [],
-      indexes: [],
+      indexes: (shape.indexes ?? []).map((index) =>
+        indexInputFromSerialized({
+          name: `${index.prefix}_${index.hash}`,
+          prefix: index.prefix,
+          columns: index.columns,
+          unique: false,
+        }),
+      ),
     });
     rlsEntries[tableName] = new PostgresRlsEnablement({ tableName, namespaceId: 'public' });
   }
@@ -127,7 +141,17 @@ function liveSchema(
       primaryKey: { columns: ['id'] },
       foreignKeys: [],
       uniques: [],
-      indexes: [],
+      indexes: (shape.indexes ?? []).map((index) => ({
+        naming: parseNaming(`${index.prefix}_${index.hash}`, index.prefix),
+        columns: index.columns,
+        where: undefined,
+        unique: false,
+        partial: false,
+        type: undefined,
+        options: undefined,
+        annotations: undefined,
+        dependsOn: undefined,
+      })),
       policies: policies.filter((policy) => policy.tableName === tableName).map(livePolicy),
       rlsEnabled: true,
     });
@@ -211,6 +235,33 @@ describe('policy drops run before structural DDL that the policy blocks', () => 
     expect(await planOpIds(contract, schema)).toEqual([
       'rlsPolicy.public.profiles.p_team_22222222.drop',
       'dropTable.teams',
+    ]);
+  });
+});
+
+describe('plans without DDL that a policy blocks', () => {
+  it('keeps index renames ahead of every policy call, drops included', async () => {
+    const before = policyOn('profiles', 'p_read_11111111', '(auth.uid() = user_id)');
+    const after = policyOn('profiles', 'p_read_22222222', '(auth.uid() = id)');
+    const index = { hash: 'ab12cd34', columns: ['user_id'] };
+    const contract = buildContract(
+      {
+        profiles: {
+          ...PROFILES,
+          indexes: [{ ...index, prefix: 'profiles_user_lookup' }],
+        },
+      },
+      [after],
+    );
+    const schema = liveSchema(
+      { profiles: { ...PROFILES, indexes: [{ ...index, prefix: 'profiles_user_idx' }] } },
+      [before],
+    );
+
+    expect(await planOpIds(contract, schema)).toEqual([
+      'index.public.profiles.profiles_user_idx_ab12cd34.rename',
+      'rlsPolicy.public.profiles.p_read_22222222',
+      'rlsPolicy.public.profiles.p_read_11111111.drop',
     ]);
   });
 });

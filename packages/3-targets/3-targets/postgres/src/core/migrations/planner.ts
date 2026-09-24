@@ -375,9 +375,11 @@ export class PostgresMigrationPlanner implements MigrationPlanner<'sql', 'postgr
         resolvePostgresCallControlPolicySubject(call, options.contract),
       resolveFactoryName: (call) => call.factoryName,
     });
+    const ordered = movePolicyDropsBeforeBlockedDdl(result.value.calls, schemaDiffPartition.kept);
     const calls = [
-      ...splicePolicyDropsBeforeEntityDrops(result.value.calls, schemaDiffPartition.kept),
+      ...ordered.structural,
       ...indexRenamePartition.kept,
+      ...ordered.policyCalls,
       ...fieldEventPartition.kept,
     ];
     // Byte-identical suppression warnings (the same subject suppressed by
@@ -890,31 +892,34 @@ function isPolicyDiffIssue(issue: SchemaDiffIssue<SqlSchemaDiffNode>): boolean {
 }
 
 /**
- * Splices RLS policy drops ahead of structural entity drops. Postgres refuses
- * to drop a column (or table) while a policy still references it (2BP01), so
- * a `dropColumn` planned before its `dropPolicy` fails at apply time. Policy
- * creates and renames stay after the structural block: creates must see the
- * columns they reference, and renames preserve policies rather than removing
- * them. With no entity drop present the input order is kept untouched.
+ * Postgres refuses to drop a column while a policy uses it, and to drop a
+ * table while a policy on another table uses it (2BP01). A table's own
+ * policies go with the table. So every policy drop moves to just before the
+ * first structural call that a policy can block. Without such a call, the
+ * policy calls keep their place after the structural calls.
  */
-function splicePolicyDropsBeforeEntityDrops(
+function movePolicyDropsBeforeBlockedDdl(
   structural: readonly PostgresOpFactoryCall[],
-  schemaDiff: readonly PostgresOpFactoryCall[],
-): readonly PostgresOpFactoryCall[] {
-  const policyDrops = schemaDiff.filter(
-    (call): call is DropPostgresRlsPolicyCall => call instanceof DropPostgresRlsPolicyCall,
+  policyCalls: readonly PostgresOpFactoryCall[],
+): {
+  readonly structural: readonly PostgresOpFactoryCall[];
+  readonly policyCalls: readonly PostgresOpFactoryCall[];
+} {
+  const firstBlockable = structural.findIndex(
+    (call) => call instanceof DropTableCall || call instanceof DropColumnCall,
   );
-  const anchor =
-    policyDrops.length === 0
-      ? -1
-      : structural.findIndex(
-          (call) => call instanceof DropTableCall || call instanceof DropColumnCall,
-        );
-  if (anchor === -1) {
-    return [...structural, ...schemaDiff];
+  if (firstBlockable === -1) {
+    return { structural, policyCalls };
   }
-  const rest = schemaDiff.filter((call) => !(call instanceof DropPostgresRlsPolicyCall));
-  return [...structural.slice(0, anchor), ...policyDrops, ...structural.slice(anchor), ...rest];
+  const isPolicyDrop = (call: PostgresOpFactoryCall) => call instanceof DropPostgresRlsPolicyCall;
+  return {
+    structural: [
+      ...structural.slice(0, firstBlockable),
+      ...policyCalls.filter(isPolicyDrop),
+      ...structural.slice(firstBlockable),
+    ],
+    policyCalls: policyCalls.filter((call) => !isPolicyDrop(call)),
+  };
 }
 
 /**
