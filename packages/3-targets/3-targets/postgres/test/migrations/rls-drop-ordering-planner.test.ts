@@ -1,0 +1,216 @@
+/**
+ * Where the planner puts RLS policy drops relative to structural DDL.
+ * Postgres refuses to drop a column while a policy uses it, and refuses to
+ * drop a table that a policy on another table uses. So when a plan drops a
+ * column or a table, its policy drops run first.
+ *
+ * The planner does not parse policy bodies, so the `using` text below only
+ * documents the dependency each scenario is about.
+ */
+
+import { type Contract, coreHash, profileHash } from '@internal/contract/types';
+import type { ExecuteRequestLowerer } from '@internal/family-sql/control-adapter';
+import { APP_SPACE_ID } from '@internal/framework-components/control';
+import { SqlStorage, StorageTable } from '@internal/sql-contract/types';
+import { parseNaming } from '@internal/sql-schema-ir/naming';
+import { applicationDomainOf } from '@repo/test-utils';
+import { describe, expect, it } from 'vitest';
+import { createPostgresMigrationPlanner } from '../../src/core/migrations/planner';
+import { PostgresRlsEnablement } from '../../src/core/postgres-rls-enablement';
+import { PostgresRlsPolicy } from '../../src/core/postgres-rls-policy';
+import { PostgresSchema } from '../../src/core/postgres-schema';
+import { PostgresDatabaseSchemaNode } from '../../src/core/schema-ir/postgres-database-schema-node';
+import { PostgresNamespaceSchemaNode } from '../../src/core/schema-ir/postgres-namespace-schema-node';
+import { PostgresPolicySchemaNode } from '../../src/core/schema-ir/postgres-policy-schema-node';
+import { PostgresTableSchemaNode } from '../../src/core/schema-ir/postgres-table-schema-node';
+
+const stubLowerer: ExecuteRequestLowerer = {
+  lower: () => ({ sql: 'stub', params: [] }),
+  lowerToExecuteRequest: async () => ({ sql: 'stub', params: [] }),
+};
+
+interface TableShape {
+  readonly columns: Readonly<Record<string, string>>;
+}
+
+type Tables = Readonly<Record<string, TableShape>>;
+
+const PROFILES: TableShape = { columns: { id: 'int4', user_id: 'int4' } };
+
+function policyOn(tableName: string, name: string, using: string): PostgresRlsPolicy {
+  return new PostgresRlsPolicy({
+    naming: parseNaming(name, name.replace(/_[0-9a-f]{8}$/, '')),
+    tableName,
+    namespaceId: 'public',
+    operation: 'select',
+    roles: ['authenticated'],
+    using,
+    withCheck: undefined,
+    permissive: true,
+  });
+}
+
+function buildContract(
+  tables: Tables,
+  policies: readonly PostgresRlsPolicy[],
+): Contract<SqlStorage> {
+  const tableEntries: Record<string, StorageTable> = {};
+  const rlsEntries: Record<string, PostgresRlsEnablement> = {};
+  for (const [tableName, shape] of Object.entries(tables)) {
+    tableEntries[tableName] = new StorageTable({
+      columns: Object.fromEntries(
+        Object.entries(shape.columns).map(([name, nativeType]) => [
+          name,
+          { nativeType, codecId: `pg/${nativeType}@1`, nullable: false },
+        ]),
+      ),
+      primaryKey: { columns: ['id'] },
+      foreignKeys: [],
+      uniques: [],
+      indexes: [],
+    });
+    rlsEntries[tableName] = new PostgresRlsEnablement({ tableName, namespaceId: 'public' });
+  }
+  const policyEntries: Record<string, PostgresRlsPolicy> = {};
+  for (const policy of policies) {
+    policyEntries[policy.name] = policy;
+  }
+  return {
+    target: 'postgres',
+    targetFamily: 'sql',
+    profileHash: profileHash('rls-drop-ordering-planner-test'),
+    storage: new SqlStorage({
+      storageHash: coreHash('rls-drop-ordering-planner-test'),
+      namespaces: {
+        public: new PostgresSchema({
+          id: 'public',
+          entries: { table: tableEntries, policy: policyEntries, rls: rlsEntries },
+        }),
+      },
+    }),
+    roots: {},
+    domain: applicationDomainOf({ models: {} }),
+    capabilities: {},
+    extensions: {},
+    meta: {},
+  };
+}
+
+function livePolicy(policy: PostgresRlsPolicy): PostgresPolicySchemaNode {
+  return new PostgresPolicySchemaNode({
+    naming: parseNaming(policy.name, policy.prefix),
+    tableName: policy.tableName,
+    namespaceId: 'public',
+    operation: policy.operation,
+    roles: [...policy.roles],
+    using: policy.using,
+    withCheck: policy.withCheck,
+    permissive: policy.permissive,
+    dependsOn: undefined,
+  });
+}
+
+function liveSchema(
+  tables: Tables,
+  policies: readonly PostgresRlsPolicy[],
+): PostgresDatabaseSchemaNode {
+  const tableNodes: Record<string, PostgresTableSchemaNode> = {};
+  for (const [tableName, shape] of Object.entries(tables)) {
+    tableNodes[tableName] = new PostgresTableSchemaNode({
+      name: tableName,
+      columns: Object.fromEntries(
+        Object.entries(shape.columns).map(([name, nativeType]) => [
+          name,
+          { name, nativeType, nullable: false },
+        ]),
+      ),
+      primaryKey: { columns: ['id'] },
+      foreignKeys: [],
+      uniques: [],
+      indexes: [],
+      policies: policies.filter((policy) => policy.tableName === tableName).map(livePolicy),
+      rlsEnabled: true,
+    });
+  }
+  return new PostgresDatabaseSchemaNode({
+    namespaces: {
+      public: new PostgresNamespaceSchemaNode({
+        schemaName: 'public',
+        tables: tableNodes,
+      }),
+    },
+    roles: [],
+    existingSchemas: ['public'],
+    pgVersion: 'unknown',
+  });
+}
+
+async function planOpIds(
+  contract: Contract<SqlStorage>,
+  schema: PostgresDatabaseSchemaNode,
+): Promise<readonly string[]> {
+  const planner = createPostgresMigrationPlanner(stubLowerer);
+  const result = planner.plan({
+    contract,
+    schema,
+    policy: { allowedOperationClasses: ['additive', 'widening', 'destructive'] },
+    fromContract: null,
+    frameworkComponents: [],
+    spaceId: APP_SPACE_ID,
+    snapshotsImportPath: '../../snapshots',
+  });
+  if (result.kind !== 'success') {
+    throw new Error(`expected a plan, got ${JSON.stringify(result)}`);
+  }
+  const ops = await Promise.all(result.plan.operations);
+  return ops.map((op) => op.id);
+}
+
+describe('policy drops run before structural DDL that the policy blocks', () => {
+  it('drops a policy before dropping a column it uses', async () => {
+    const readOwn = policyOn('profiles', 'p_read_11111111', '(auth.uid() = user_id)');
+    const readPublished = policyOn('profiles', 'p_pub_22222222', '(published = true)');
+    const contract = buildContract({ profiles: PROFILES }, [readOwn]);
+    const schema = liveSchema(
+      { profiles: { columns: { ...PROFILES.columns, published: 'bool' } } },
+      [readOwn, readPublished],
+    );
+
+    expect(await planOpIds(contract, schema)).toEqual([
+      'rlsPolicy.public.profiles.p_pub_22222222.drop',
+      'dropColumn.profiles.published',
+    ]);
+  });
+
+  it('drops a policy on another table before dropping a column the policy uses', async () => {
+    const postsOfPublished = policyOn(
+      'posts',
+      'p_pub_22222222',
+      '(exists (select 1 from profiles where profiles.published))',
+    );
+    const posts: TableShape = { columns: { id: 'int4', author_id: 'int4' } };
+    const contract = buildContract({ profiles: PROFILES, posts }, []);
+    const schema = liveSchema(
+      { profiles: { columns: { ...PROFILES.columns, published: 'bool' } }, posts },
+      [postsOfPublished],
+    );
+
+    expect(await planOpIds(contract, schema)).toEqual([
+      'rlsPolicy.public.posts.p_pub_22222222.drop',
+      'dropColumn.profiles.published',
+    ]);
+  });
+
+  it('drops a policy before dropping another table the policy uses', async () => {
+    const readTeams = policyOn('profiles', 'p_team_22222222', '(exists (select 1 from teams))');
+    const contract = buildContract({ profiles: PROFILES }, []);
+    const schema = liveSchema({ profiles: PROFILES, teams: { columns: { id: 'int4' } } }, [
+      readTeams,
+    ]);
+
+    expect(await planOpIds(contract, schema)).toEqual([
+      'rlsPolicy.public.profiles.p_team_22222222.drop',
+      'dropTable.teams',
+    ]);
+  });
+});
