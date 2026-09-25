@@ -1,18 +1,25 @@
 /**
  * Where the planner puts RLS policy drops relative to structural DDL. Postgres refuses to drop a
- * column or change its type while a policy uses it, and refuses to drop a table or an enum type
- * that a policy on another table uses. So when a plan contains such a statement, its policy drops
- * run just before it. Otherwise the plan keeps its usual order: structural DDL, then index and
- * check-constraint renames, then policy calls.
+ * column or change its type while a policy uses it, to drop a table that a policy on another table
+ * uses, and to drop or rebuild a type that a policy uses. So when a plan contains such a statement,
+ * its policy drops run just before it. Otherwise the plan keeps its usual order: structural DDL,
+ * then index and check-constraint renames, then policy calls.
  *
  * The planner does not parse policy bodies, so the `using` text below only documents the dependency
  * each scenario is about.
  */
 
 import { type Contract, coreHash, profileHash } from '@internal/contract/types';
+import type { CodecControlHooks } from '@internal/family-sql/control';
 import type { ExecuteRequestLowerer } from '@internal/family-sql/control-adapter';
-import { APP_SPACE_ID } from '@internal/framework-components/control';
-import { indexInputFromSerialized, SqlStorage, StorageTable } from '@internal/sql-contract/types';
+import type { TargetBoundComponentDescriptor } from '@internal/framework-components/components';
+import { APP_SPACE_ID, type MigrationOperationClass } from '@internal/framework-components/control';
+import {
+  indexInputFromSerialized,
+  SqlStorage,
+  StorageTable,
+  type StorageTypeInstance,
+} from '@internal/sql-contract/types';
 import { parseNaming } from '@internal/sql-schema-ir/naming';
 import { applicationDomainOf } from '@repo/test-utils';
 import { describe, expect, it } from 'vitest';
@@ -62,6 +69,7 @@ function policyOn(tableName: string, name: string, using: string): PostgresRlsPo
 function buildContract(
   tables: Tables,
   policies: readonly PostgresRlsPolicy[],
+  types: Readonly<Record<string, StorageTypeInstance>> = {},
 ): Contract<SqlStorage> {
   const tableEntries: Record<string, StorageTable> = {};
   const rlsEntries: Record<string, PostgresRlsEnablement> = {};
@@ -97,6 +105,7 @@ function buildContract(
     profileHash: profileHash('rls-drop-ordering-planner-test'),
     storage: new SqlStorage({
       storageHash: coreHash('rls-drop-ordering-planner-test'),
+      types,
       namespaces: {
         public: new PostgresSchema({
           id: 'public',
@@ -180,10 +189,60 @@ function liveSchema(
   });
 }
 
+const APP_ROLE_CODEC_ID = 'app/role@1';
+
+const APP_ROLE_TYPES: Readonly<Record<string, StorageTypeInstance>> = {
+  app_role: {
+    kind: 'codec-instance',
+    codecId: APP_ROLE_CODEC_ID,
+    nativeType: 'app_role',
+    typeParams: { values: ['owner', 'member'] },
+  },
+};
+
+interface CodecTypeOperation {
+  readonly id: string;
+  readonly operationClass: MigrationOperationClass;
+  readonly sql: string;
+}
+
+function appRoleCodec(
+  operation: CodecTypeOperation,
+): TargetBoundComponentDescriptor<'sql', string> {
+  const hooks: CodecControlHooks = {
+    planTypeOperations: () => ({
+      operations: [
+        {
+          id: operation.id,
+          label: operation.id,
+          operationClass: operation.operationClass,
+          target: { id: 'postgres' },
+          precheck: [],
+          execute: [{ description: operation.id, sql: operation.sql }],
+          postcheck: [],
+        },
+      ],
+    }),
+  };
+  return {
+    kind: 'adapter',
+    id: 'app-role-codec',
+    familyId: 'sql',
+    targetId: 'postgres',
+    version: '0.0.0-test',
+    types: { codecTypes: { controlPlaneHooks: { [APP_ROLE_CODEC_ID]: hooks } } },
+  };
+}
+
+interface PlanInputs {
+  readonly fromContract?: Contract<SqlStorage> | null;
+  readonly frameworkComponents?: ReadonlyArray<TargetBoundComponentDescriptor<'sql', string>>;
+}
+
 async function planOpIds(
   contract: Contract<SqlStorage>,
   schema: PostgresDatabaseSchemaNode,
-  fromContract: Contract<SqlStorage> | null = null,
+  { fromContract = null, frameworkComponents = [] }: PlanInputs = {},
 ): Promise<readonly string[]> {
   const planner = createPostgresMigrationPlanner(stubLowerer);
   const result = planner.plan({
@@ -191,7 +250,7 @@ async function planOpIds(
     schema,
     policy: { allowedOperationClasses: ['additive', 'widening', 'destructive'] },
     fromContract,
-    frameworkComponents: [],
+    frameworkComponents,
     spaceId: APP_SPACE_ID,
     snapshotsImportPath: '../../snapshots',
   });
@@ -277,7 +336,7 @@ describe('policy drops run before structural DDL that the policy blocks', () => 
     });
 
     it('is dropped before the type change in a migration plan', async () => {
-      expect(await planOpIds(contract, schema, fromContract)).toEqual(expected);
+      expect(await planOpIds(contract, schema, { fromContract })).toEqual(expected);
     });
   });
 
@@ -293,6 +352,32 @@ describe('policy drops run before structural DDL that the policy blocks', () => 
     expect(await planOpIds(contract, schema)).toEqual([
       'rlsPolicy.public.profiles.p_admin_22222222.drop',
       'dropNativeEnumType.app_role',
+    ]);
+  });
+
+  it('drops a policy before a codec operation that rebuilds a type the policy casts to', async () => {
+    const before = policyOn(
+      'profiles',
+      'p_role_11111111',
+      "(current_setting('app.role')::app_role = 'admin')",
+    );
+    const after = policyOn(
+      'profiles',
+      'p_role_22222222',
+      "(current_setting('app.role')::app_role = 'owner')",
+    );
+    const contract = buildContract({ profiles: PROFILES }, [after], APP_ROLE_TYPES);
+    const schema = liveSchema({ profiles: PROFILES }, [before]);
+    const rebuild = appRoleCodec({
+      id: 'type.app_role.rebuild',
+      operationClass: 'destructive',
+      sql: "DROP TYPE app_role; CREATE TYPE app_role AS ENUM ('owner', 'member')",
+    });
+
+    expect(await planOpIds(contract, schema, { frameworkComponents: [rebuild] })).toEqual([
+      'rlsPolicy.public.profiles.p_role_11111111.drop',
+      'type.app_role.rebuild',
+      'rlsPolicy.public.profiles.p_role_22222222',
     ]);
   });
 });
@@ -320,6 +405,32 @@ describe('plans without DDL that a policy blocks', () => {
       'index.public.profiles.profiles_user_idx_ab12cd34.rename',
       'rlsPolicy.public.profiles.p_read_22222222',
       'rlsPolicy.public.profiles.p_read_11111111.drop',
+    ]);
+  });
+
+  it('keeps policy calls after an additive codec type operation', async () => {
+    const before = policyOn(
+      'profiles',
+      'p_role_11111111',
+      "(current_setting('app.role')::app_role = 'admin')",
+    );
+    const after = policyOn(
+      'profiles',
+      'p_role_22222222',
+      "(current_setting('app.role')::app_role = 'owner')",
+    );
+    const contract = buildContract({ profiles: PROFILES }, [after], APP_ROLE_TYPES);
+    const schema = liveSchema({ profiles: PROFILES }, [before]);
+    const addValue = appRoleCodec({
+      id: 'type.app_role.addValue',
+      operationClass: 'additive',
+      sql: "ALTER TYPE app_role ADD VALUE 'owner'",
+    });
+
+    expect(await planOpIds(contract, schema, { frameworkComponents: [addValue] })).toEqual([
+      'type.app_role.addValue',
+      'rlsPolicy.public.profiles.p_role_22222222',
+      'rlsPolicy.public.profiles.p_role_11111111.drop',
     ]);
   });
 });

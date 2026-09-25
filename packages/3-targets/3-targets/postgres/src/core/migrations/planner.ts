@@ -62,6 +62,7 @@ import {
   DropNativeEnumTypeCall,
   DropPostgresRlsPolicyCall,
   DropTableCall,
+  RawSqlCall,
   RenameCheckConstraintCall,
   RenameIndexCall,
   RenamePostgresRlsPolicyCall,
@@ -894,11 +895,16 @@ function isPolicyDiffIssue(issue: SchemaDiffIssue<SqlSchemaDiffNode>): boolean {
 }
 
 /**
- * Postgres refuses to drop a column while a policy uses it (2BP01) or to change its type (0A000),
- * and refuses to drop a table or an enum type while a policy on another table uses it (2BP01). A
- * table's own policies go with the table. So every policy drop moves to just before the first
- * structural call that a policy can block. Without such a call, the policy calls keep their place
- * after the structural calls.
+ * Postgres refuses these statements while a policy uses the object they touch:
+ * - dropping a column (2BP01) or changing its type (0A000);
+ * - dropping a table that a policy on another table uses (2BP01); a table's own policies go with it;
+ * - dropping a native enum type (2BP01);
+ * - a destructive codec type operation (a `RawSqlCall` on a type), such as dropping or rebuilding
+ *   the type (2BP01) or changing a composite type's attribute type (0A000). Additive and widening
+ *   type operations, such as adding an enum value or renaming the type, go through.
+ *
+ * So every policy drop moves to just before the first structural call that a policy can block.
+ * Without such a call, the policy calls keep their place after the structural calls.
  */
 function movePolicyDropsBeforeBlockedDdl(
   structural: readonly PostgresOpFactoryCall[],
@@ -907,13 +913,7 @@ function movePolicyDropsBeforeBlockedDdl(
   readonly structural: readonly PostgresOpFactoryCall[];
   readonly policyCalls: readonly PostgresOpFactoryCall[];
 } {
-  const firstBlockable = structural.findIndex(
-    (call) =>
-      call instanceof DropColumnCall ||
-      call instanceof AlterColumnTypeCall ||
-      call instanceof DropTableCall ||
-      call instanceof DropNativeEnumTypeCall,
-  );
+  const firstBlockable = structural.findIndex(policyCanBlock);
   if (firstBlockable === -1) {
     return { structural, policyCalls };
   }
@@ -926,6 +926,18 @@ function movePolicyDropsBeforeBlockedDdl(
     ],
     policyCalls: policyCalls.filter((call) => !isPolicyDrop(call)),
   };
+}
+
+function policyCanBlock(call: PostgresOpFactoryCall): boolean {
+  if (call instanceof RawSqlCall) {
+    return call.operationClass === 'destructive' && call.op.target.details?.objectType === 'type';
+  }
+  return (
+    call instanceof DropColumnCall ||
+    call instanceof AlterColumnTypeCall ||
+    call instanceof DropTableCall ||
+    call instanceof DropNativeEnumTypeCall
+  );
 }
 
 /**
